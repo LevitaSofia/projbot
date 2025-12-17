@@ -1143,20 +1143,41 @@ def trading_loop():
 
                             if strategy['position'] is None:
                                 # Sem posição - procura oportunidades de COMPRA
-                                tolerance = bb_lower * 0.01  # 1% de tolerância (igual check_strategy_signal)
-                                price_ok = price <= bb_lower + tolerance
-                                rsi_ok = rsi < 45
-                                signal = check_strategy_signal(selected, price, rsi, bb_lower)
+                                rsi_target = STRATEGY_PARAMS['RSI_TARGET']
+                                tolerance_pct = STRATEGY_PARAMS['TOLERANCE']
+                                tolerance = bb_lower * tolerance_pct
+                                price_limit = bb_lower + tolerance
                                 
-                                # Mostra debug para TODAS moedas com RSI < 45
-                                if rsi_ok:
-                                    print(f"📊 {current_symbol} | RSI={rsi:.1f}✅ | Preço=${price:.2f} | BB=${bb_lower:.2f} | Limite=${bb_lower + tolerance:.2f} | PrçOK={price_ok} | SINAL={signal}")
+                                # Verifica cada condição
+                                rsi_ok = rsi < rsi_target
+                                price_ok = price <= price_limit
+                                saldo_ok = current_balance >= 10.5
+                                
+                                signal = rsi_ok and price_ok and saldo_ok
+                                
+                                # Mostra debug para moedas promissoras (RSI < 45)
+                                if rsi < 45:
+                                    print(f"📊 {current_symbol} | RSI={rsi:.1f}{'✅' if rsi_ok else '❌'} | Preço=${price:.2f} | Limite=${price_limit:.2f} {'✅' if price_ok else '❌'} | Saldo=${current_balance:.2f} {'✅' if saldo_ok else '❌'}")
                                 
                                 if signal:
                                     print(f"🎯 SINAL DE COMPRA DETECTADO para {current_symbol}!")
                                     result = execute_real_trade('buy', price, current_symbol)
                                     if result:
                                         break # Sai do loop de moedas após compra bem-sucedida
+                                elif rsi < 45:
+                                    # Explica por que NÃO comprou (só pra moedas promissoras)
+                                    motivos = []
+                                    if not rsi_ok:
+                                        motivos.append(f"RSI={rsi:.1f} (precisa <{rsi_target})")
+                                    if not price_ok:
+                                        dist = ((price - price_limit) / price_limit) * 100
+                                        motivos.append(f"Preço ${price:.4f} > limite ${price_limit:.4f} (+{dist:.1f}%)")
+                                    if not saldo_ok:
+                                        motivos.append(f"Saldo ${current_balance:.2f} < $11 (converte BRL?)")
+                                    
+                                    # Só envia Telegram se tiver motivo relevante (evita spam)
+                                    if motivos and rsi < 40:  # RSI < 40 = quase comprando
+                                        send_telegram_message(f"⏸️ *{current_symbol}* — não comprou\\n" + "\\n".join(motivos))
                             else:
                                 # TEM POSIÇÃO - verifica VENDA
                                 pos_symbol = strategy['position'].get('symbol', SYMBOL)
