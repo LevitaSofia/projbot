@@ -788,23 +788,27 @@ def execute_real_trade(action, price, symbol):
         strategy = lab_state['strategies'][strategy_key]
 
         if action == 'buy':
-            # VERIFICAÇÃO DE SALDO ANTES DE COMPRAR
-            usdt_balance = lab_state.get('real_balance', 0.0)
+            # BUSCA SALDO REAL DA BINANCE (não usa cache)
+            balance = exchange.fetch_balance()
+            usdt_balance = balance['USDT']['free']
+            print(f"💳 Saldo REAL da Binance: ${usdt_balance:.2f} USDT")
+            lab_state['real_balance'] = usdt_balance  # Atualiza cache
             
             # Se não tem USDT suficiente, tenta converter BRL para USDT
-            if usdt_balance < MIN_ORDER_VALUE:
+            if usdt_balance < 10.5:  # Margem pra taxa
                 print(f"⚠️ Saldo USDT baixo (${usdt_balance:.2f}). Tentando converter BRL...")
                 usdt_balance = convert_brl_to_usdt()
                 
                 # Se ainda não tem saldo após conversão - apenas loga, não envia Telegram repetido
-                if usdt_balance < MIN_ORDER_VALUE:
-                    print(f"⚠️ Saldo insuficiente: ${usdt_balance:.2f} < ${MIN_ORDER_VALUE}")
+                if usdt_balance < 10.5:
+                    print(f"⚠️ Saldo insuficiente: ${usdt_balance:.2f} < $11.00")
                     return False
             
             # Usa o valor disponível (máximo de AMOUNT_INVEST ou saldo disponível)
             invest_amount = min(AMOUNT_INVEST, usdt_balance * 0.95)  # 95% para taxa
+            print(f"💰 AMOUNT_INVEST={AMOUNT_INVEST}, usdt_balance*0.95={usdt_balance * 0.95:.2f}, invest_amount={invest_amount:.2f}")
             
-            if invest_amount < MIN_ORDER_VALUE:
+            if invest_amount < 10.5:  # Margem pra taxa
                 print(f"⚠️ Valor de investimento muito baixo: ${invest_amount:.2f}")
                 return False
             
