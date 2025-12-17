@@ -2001,17 +2001,26 @@ async def telegram_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ API não conectada!")
             return
         
+        # Busca saldo REAL da Binance (não usa cache)
+        balance = exchange.fetch_balance()
+        usdt_balance = balance['USDT']['free']
+        lab_state['real_balance'] = usdt_balance  # Atualiza cache
+        
         ticker = exchange.fetch_ticker(symbol)
         current_price = ticker['last']
         
         # Calcula quantidade
-        amount = min(AMOUNT_INVEST, lab_state.get('real_balance', 0) * 0.95)
-        if amount < MIN_ORDER_VALUE:
-            await update.message.reply_text(f"❌ Saldo insuficiente! Precisa de ${MIN_ORDER_VALUE}, tem ${lab_state.get('real_balance', 0):.2f}")
+        amount = min(AMOUNT_INVEST, usdt_balance * 0.95)
+        if usdt_balance < 10.5:  # Margem pra taxa
+            await update.message.reply_text(f"❌ Saldo insuficiente! Precisa de $11.00, tem ${usdt_balance:.2f}")
             return
         
         qty = amount / current_price
         order = exchange.create_market_buy_order(symbol, qty)
+        
+        # Atualiza saldo com valor REAL gasto
+        usdt_gasto = order.get('cost', amount)
+        lab_state['real_balance'] = usdt_balance - usdt_gasto
         
         # Salva posição
         strategy_key = lab_state['selected_strategy']
@@ -2025,9 +2034,13 @@ async def telegram_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Aguarda Binance refletir a ordem
         time.sleep(3)
         
-        # Atualiza saldo real (subtrai USDT gasto)
-        usdt_gasto = order.get('average', current_price) * order['filled']
-        lab_state['real_balance'] = max(0, lab_state.get('real_balance', 0) - usdt_gasto)
+        # Busca saldo atualizado da Binance
+        try:
+            balance = exchange.fetch_balance()
+            lab_state['real_balance'] = balance['USDT']['free']
+        except:
+            pass  # Já atualizou antes
+        
         print(f"💸 Gasto: ${usdt_gasto:.2f} USDT | Saldo restante: ${lab_state['real_balance']:.2f}")
         
         save_lab_data()
