@@ -576,6 +576,10 @@ WATCHLIST = [
     'BTC/USDT',    # ~$90000
 ]
 
+# === MODO SANDRA: APOSTAS VARIÁVEIS ===
+HIGH_VOLATILITY_COINS = ['DOGE/USDT', 'ADA/USDT', 'SOL/USDT', 'XRP/USDT', 'LINK/USDT']
+GLOBAL_STATS = {'peak_balance': 0.0, 'drawdown_mode': False}
+
 # Valor mínimo de ordem na Binance (em USDT)
 MIN_ORDER_VALUE = 11.0
 
@@ -602,27 +606,35 @@ def fetch_market_data(symbol):
         return None, None, None, None
 
 
-def check_strategy_signal(strategy_name, price, rsi, bb_lower):
-    """Verifica se dá sinal de compra - USA PARÂMETROS DINÂMICOS DA IA."""
-    # Pega parâmetros ajustáveis (podem ser modificados pela IA)
+def check_strategy_signal(strategy_name, price, rsi, bb_lower, symbol):
+    """
+    CÉREBRO SANDRA: Define o tamanho da mão ($) com base na força do sinal.
+    Retorna: 0.0 (não compra), 8.0 (proteção), 11.0 (normal), 22.0 (forte), 33.0 (excepcional)
+    """
+    # 1. Modo Proteção (Se perdeu 10% do topo)
+    if GLOBAL_STATS['drawdown_mode']:
+        if rsi < 30 and price < bb_lower:
+            return 8.0  # Mão leve para recuperar
+        return 0.0
+
+    # 2. Definição da Força do Sinal
+    
+    # SINAL EXCEPCIONAL ($33) - RSI no chão + Moeda Volátil
+    if rsi < 20 and price < bb_lower * 0.99 and symbol in HIGH_VOLATILITY_COINS:
+        print(f"💎 SINAL DE OURO em {symbol}! RSI={rsi:.1f} (Apostando $33)")
+        return 33.0
+
+    # SINAL FORTE ($22) - RSI muito baixo
+    if rsi < 25 and price < bb_lower * 0.995:
+        print(f"🔥 SINAL FORTE em {symbol}. RSI={rsi:.1f} (Apostando $22)")
+        return 22.0
+
+    # SINAL NORMAL ($11) - Padrão
     rsi_target = STRATEGY_PARAMS['RSI_TARGET']
-    tolerance_pct = STRATEGY_PARAMS['TOLERANCE']
-    
-    tolerance = bb_lower * tolerance_pct
-    
-    # CONDIÇÃO 1: RSI baixo
-    rsi_low = rsi < rsi_target
-    
-    # CONDIÇÃO 2: Preço DEVE estar na banda inferior ou abaixo
-    price_at_bottom = price <= bb_lower + tolerance
-    
-    # SÓ COMPRA SE AMBAS AS CONDIÇÕES FOREM VERDADEIRAS
-    should_buy = rsi_low and price_at_bottom
-    
-    if should_buy:
-        print(f"🎯 SINAL DE COMPRA: RSI={rsi:.1f} (<{rsi_target}) + Preço na banda inferior!")
-    
-    return should_buy
+    if rsi < rsi_target and price <= bb_lower * (1 + STRATEGY_PARAMS['TOLERANCE']):
+        return 11.0
+
+    return 0.0
 
 
 def get_diagnostic(strategy_name, price, rsi, bb_lower, position=None):
@@ -969,47 +981,55 @@ def execute_real_trade(action, price, symbol):
                 entry_time = strategy['position'].get('entry_time', 'N/A') if strategy.get('position') else 'N/A'
                 
                 sell_price = order['average'] or price
-                profit_pct = ((sell_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
-                profit_usdt = (sell_price - entry_price) * order['filled']
+                sell_qty = order['filled']
                 rsi = lab_state['indicators']['rsi']
                 
-                # Confirma saldo atualizado (com fallback local)
+                # === CÁLCULO SANDRA (LUCRO LÍQUIDO REAL COM TAXAS) ===
+                fee_rate = 0.001  # 0.1% Binance
+                custo_compra = (entry_price * sell_qty) * (1 + fee_rate)
+                receita_venda = (sell_price * sell_qty) * (1 - fee_rate)
+                lucro_liquido_usdt = receita_venda - custo_compra
+                lucro_liquido_pct = (lucro_liquido_usdt / custo_compra) * 100 if custo_compra > 0 else 0
+                taxas_totais = (entry_price * sell_qty * fee_rate) + (sell_price * sell_qty * fee_rate)
+                
+                # Atualiza saldo real
                 try:
                     balance = exchange.fetch_balance()
                     lab_state['real_balance'] = balance['total'].get('USDT', 0.0)
                     print(f"✅ Saldo confirmado: ${lab_state['real_balance']:.2f} USDT")
                 except Exception as e:
                     # Fallback: calcula saldo local
-                    usdt_recebido = sell_price * order['filled']
-                    lab_state['real_balance'] = lab_state.get('real_balance', 0) + usdt_recebido
+                    lab_state['real_balance'] = lab_state.get('real_balance', 0) + receita_venda
                     print(f"⚠️ Erro Binance: {e} | Saldo estimado: ${lab_state['real_balance']:.2f} USDT")
 
                 trade = {
                     'time': datetime.now().strftime('%H:%M:%S'),
                     'type': f'SELL REAL ({symbol})',
                     'price': sell_price,
-                    'qty': order['filled'],
+                    'qty': sell_qty,
                     'order_id': order['id'],
                     'mode': 'REAL',
-                    'entry_price': entry_price,  # Salva preço de compra
-                    'profit_pct': profit_pct,    # Salva % lucro
-                    'profit_usdt': profit_usdt,  # Salva lucro em USDT
-                    'rsi': rsi  # Salva RSI para análise da IA
+                    'entry_price': entry_price,
+                    'net_profit_usdt': lucro_liquido_usdt,  # Novo: Lucro líquido
+                    'net_profit_pct': lucro_liquido_pct,    # Novo: % líquido
+                    'fees': taxas_totais,                    # Novo: Taxas totais
+                    'rsi': rsi
                 }
                 strategy['trades'].append(trade)
-                strategy['position'] = None # Limpa posição
+                strategy['position'] = None  # Limpa posição
                 
-                print(f"💵 [{strategy['name']}] VENDA REAL: {order['filled']} {symbol} @ ${sell_price:.2f}")
-                print(f"📊 Compra: ${entry_price:.4f} → Venda: ${sell_price:.4f} = {profit_pct:+.2f}% (${profit_usdt:+.4f})")
+                print(f"💵 [{strategy['name']}] VENDA REAL: {sell_qty} {symbol} @ ${sell_price:.2f}")
+                print(f"📊 Compra: ${entry_price:.4f} → Venda: ${sell_price:.4f}")
+                print(f"💰 Lucro LÍQUIDO: ${lucro_liquido_usdt:+.2f} ({lucro_liquido_pct:+.2f}%) | Taxas: ${taxas_totais:.3f}")
                 
-                # Notificação Telegram COMPLETA
+                # Notificação Telegram ATUALIZADA (Formato Sandra)
                 msg = (
-                    f"💵 *VENDA REAL*\\n\\n"
-                    f"🪙 Moeda: {symbol}\\n"
+                    f"💰 *VENDA REALIZADA*\\n\\n"
+                    f"🪙 {symbol}\\n"
                     f"📥 Compra: ${entry_price:.4f}\\n"
                     f"📤 Venda: ${sell_price:.4f}\\n"
-                    f"📊 Qtd: {order['filled']:.4f}\\n"
-                    f"{'🟢' if profit_pct >= 0 else '🔴'} Lucro: {profit_pct:+.2f}% (${profit_usdt:+.2f})\\n"
+                    f"💵 Líquido: *${lucro_liquido_usdt:+.2f}* ({lucro_liquido_pct:+.2f}%)\\n"
+                    f"🏦 Taxas: -${taxas_totais:.3f}\\n"
                     f"📈 RSI: {rsi:.1f}"
                 )
                 send_telegram_message(msg)
@@ -1179,28 +1199,34 @@ def trading_loop():
                             strategy = lab_state['strategies'][selected]
 
                             if strategy['position'] is None:
-                                # Sem posição - procura oportunidades de COMPRA
-                                rsi_target = STRATEGY_PARAMS['RSI_TARGET']
-                                tolerance_pct = STRATEGY_PARAMS['TOLERANCE']
-                                tolerance = bb_lower * tolerance_pct
-                                price_limit = bb_lower + tolerance
+                                # Sem posição - procura oportunidades de COMPRA (MODO SANDRA)
                                 
-                                # Verifica cada condição
-                                rsi_ok = rsi < rsi_target
-                                price_ok = price <= price_limit
-                                saldo_ok = current_balance >= 10.5
+                                # Atualiza controle de drawdown (perdeu 10% do topo?)
+                                if lab_state['real_balance'] > GLOBAL_STATS['peak_balance']:
+                                    GLOBAL_STATS['peak_balance'] = lab_state['real_balance']
+                                    GLOBAL_STATS['drawdown_mode'] = False
+                                elif lab_state['real_balance'] < GLOBAL_STATS['peak_balance'] * 0.9:
+                                    GLOBAL_STATS['drawdown_mode'] = True
+                                    print(f"🛡️ MODO PROTEÇÃO: Saldo caiu 10% (${lab_state['real_balance']:.2f} < ${GLOBAL_STATS['peak_balance'] * 0.9:.2f})")
                                 
-                                signal = rsi_ok and price_ok and saldo_ok
+                                # Obtém valor da aposta ($11, $22, $33 ou 0)
+                                invest_amount = check_strategy_signal(selected, price, rsi, bb_lower, current_symbol)
                                 
-                                # Mostra debug para moedas promissoras (RSI < 45)
-                                if rsi < 45:
-                                    print(f"📊 {current_symbol} | RSI={rsi:.1f}{'✅' if rsi_ok else '❌'} | Preço=${price:.2f} | Limite=${price_limit:.2f} {'✅' if price_ok else '❌'} | Saldo=${current_balance:.2f} {'✅' if saldo_ok else '❌'}")
-                                
-                                if signal:
-                                    print(f"🎯 SINAL DE COMPRA DETECTADO para {current_symbol}!")
+                                if invest_amount > 0 and current_balance >= invest_amount:
+                                    print(f"🎯 SINAL DETECTADO: Investir ${invest_amount} em {current_symbol}!")
+                                    
+                                    # Atualiza AMOUNT_INVEST temporariamente
+                                    global AMOUNT_INVEST
+                                    original_amount = AMOUNT_INVEST
+                                    AMOUNT_INVEST = invest_amount
+                                    
                                     result = execute_real_trade('buy', price, current_symbol)
+                                    
+                                    # Restaura valor original
+                                    AMOUNT_INVEST = original_amount
+                                    
                                     if result:
-                                        break # Sai do loop de moedas após compra bem-sucedida
+                                        break  # Sai do loop de moedas após compra bem-sucedida
                                 elif rsi < 45:
                                     # Explica por que NÃO comprou (só pra moedas promissoras)
                                     motivos = []
