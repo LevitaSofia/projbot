@@ -678,76 +678,63 @@ def get_diagnostic(strategy_name, price, rsi, bb_lower, position=None):
     return "⏳ " + " | ".join(issues)
 
 
-def check_exit_signal(entry_price, current_price, rsi, bb_upper=None):
+def check_exit_signal(position, current_price, rsi, bb_upper=None):
     """
-    Verifica sinal de saída - CONSERVADOR para não vender precipitadamente.
+    SAÍDA SANDRA: Trailing Stop + Proteção
+    Recebe o objeto 'position' inteiro para rastrear o preço máximo.
+    """
+    entry_price = position['entry_price']
     
-    REGRAS:
-    1. NUNCA vende com RSI baixo (< 40) - mercado sobrevendido, pode subir
-    2. NUNCA vende com prejuízo EXCETO stop loss
-    3. Stop Loss só em -3% (mais tolerante)
-    4. Take Profit precisa de lucro REAL + RSI alto
-    """
+    # Recupera ou inicia o preço máximo atingido (High Water Mark)
+    highest_price = position.get('highest_price', entry_price)
+    
+    # Atualiza o topo se o preço subiu
+    if current_price > highest_price:
+        position['highest_price'] = current_price
+        highest_price = current_price
+
     profit_pct = ((current_price - entry_price) / entry_price) * 100
     
-    # === PROTEÇÃO ANTI-PRECIPITAÇÃO ===
-    # Se RSI está baixo, mercado pode subir - NÃO VENDE (exceto stop loss grave)
-    if rsi < 40 and profit_pct > -5:
-        print(f"⏳ RSI baixo ({rsi:.1f}) - Aguardando recuperação...")
-        return False
-    
-    # Tolerância para banda superior
-    price_at_upper = False
-    if bb_upper:
-        tolerance = bb_upper * 0.01
-        price_at_upper = current_price >= bb_upper - tolerance
+    # Calcula quanto caiu desde o topo (Pullback)
+    pullback_pct = ((highest_price - current_price) / highest_price) * 100
 
     should_sell = False
     reason = []
+
+    # === 1. TRAILING STOP (Garantir Lucro Grande) ===
+    # Se o lucro já passou de 5%, ativamos o modo "Deixar Correr"
+    if profit_pct >= 5.0:
+        # Se o preço cair 2% do topo máximo, vende e embolsa o resto
+        if pullback_pct >= 2.0:
+            should_sell = True
+            reason.append(f"🏃 TRAILING STOP (Topo: ${highest_price:.2f}, Caiu 2%)")
+        else:
+            # Se não caiu 2%, NÃO VENDE! Deixa subir mais.
+            # O print abaixo ajuda a ver no log que ele está segurando
+            if random.random() < 0.1: # Loga só às vezes pra não poluir
+                print(f"🚀 Deixando correr! Lucro: {profit_pct:.1f}% (Topo: ${highest_price:.2f})")
+            return False 
+
+    # === 2. RSI ESTOURADO (Segurança) ===
+    # Se RSI passou de 75, é perigoso continuar comprado
+    elif rsi > 75:
+        should_sell = True
+        reason.append(f"🔥 RSI EXTREMO ({rsi:.0f})")
+
+    # === 3. STOP LOSS (Dinâmico da IA) ===
+    stop_limit = STRATEGY_PARAMS['STOP_LOSS']
     
-    # === TAKE PROFIT (só com RSI ALTO = confirmação de topo) ===
-    # Taxa Binance: 0.1% compra + 0.1% venda = 0.2% total
+    # Se estiver em modo de proteção, aperta o stop
+    if GLOBAL_STATS['drawdown_mode']:
+        stop_limit = max(stop_limit, -2.0)
     
-    if profit_pct >= 5.0:  # 5% = vende sempre (lucro excelente)
+    if profit_pct <= stop_limit:
         should_sell = True
-        reason.append(f"🎯 LUCRO FORTE {profit_pct:.1f}%!")
-    elif profit_pct >= 3.5 and rsi > 55:  # 3.5% + RSI subindo
-        should_sell = True
-        reason.append(f"📈 Lucro {profit_pct:.1f}% + RSI ({rsi:.0f})")
-    elif profit_pct >= 2.5 and rsi > 60:  # 2.5% + RSI alto
-        should_sell = True
-        reason.append(f"💰 Lucro {profit_pct:.1f}% + RSI bom ({rsi:.0f})")
-    elif profit_pct >= 2.0 and rsi > 65:  # 2% + RSI muito alto
-        should_sell = True
-        reason.append(f"📊 Lucro {profit_pct:.1f}% + RSI forte ({rsi:.0f})")
-    elif profit_pct >= 1.5 and rsi > 70:  # 1.5% + RSI sobrecomprado
-        should_sell = True
-        reason.append(f"🔥 Lucro {profit_pct:.1f}% + RSI extremo ({rsi:.0f})")
-    elif price_at_upper and profit_pct >= 1.5 and rsi > 55:  # Banda superior + lucro + RSI ok
-        should_sell = True
-        reason.append(f"🔴 BANDA SUPERIOR + Lucro {profit_pct:.1f}%")
-    
-    # === STOP LOSS (usa parâmetro dinâmico da IA) ===
-    stop_loss = STRATEGY_PARAMS['STOP_LOSS']
-    if profit_pct <= stop_loss:
-        should_sell = True
-        reason.append(f"🛑 STOP LOSS {profit_pct:.1f}% (limite: {stop_loss}%)")
-    
-    # === STOP LOSS DE EMERGÊNCIA ===
-    # Se perdendo muito, vende independente de RSI
-    if profit_pct <= -5.0:
-        should_sell = True
-        reason.append(f"🚨 EMERGÊNCIA {profit_pct:.1f}% - Saindo!")
-    
+        reason.append(f"🛑 STOP LOSS ({stop_limit}%)")
+
     if should_sell:
-        print(f"🔔 SINAL DE VENDA: {', '.join(reason)}")
-    else:
-        # Log para debug quando NÃO vende
-        if profit_pct < 0:
-            print(f"⏳ Aguardando: Prejuízo {profit_pct:.1f}% (Stop em {stop_loss}%) | RSI={rsi:.1f}")
-        elif profit_pct > 0 and profit_pct < 1.5:
-            print(f"⏳ Aguardando: Lucro {profit_pct:.1f}% (Meta mínima 1.5%) | RSI={rsi:.1f}")
-    
+        print(f"🔔 VENDA: {', '.join(reason)} | Lucro Final: {profit_pct:.2f}%")
+
     return should_sell
 
 
@@ -1252,9 +1239,10 @@ def trading_loop():
                                     
                                     # LOG DETALHADO antes de verificar venda
                                     bb_display = f"${bb_upper:.2f}" if bb_upper else "$0"
-                                    print(f"🔍 [DEBUG] Verificando saída: RSI={rsi:.1f} | Lucro={profit_pct:.2f}% | BB_Upper={bb_display}")
+                                    print(f"🔍 [DEBUG] Verificando saída: RSI={rsi:.1f} | Lucro={profit_pct:+.2f}% | BB_Upper={bb_display}")
                                     
-                                    should_sell = check_exit_signal(entry_price, price, rsi, bb_upper)
+                                    # Passamos a posição inteira (strategy['position']) para Trailing Stop
+                                    should_sell = check_exit_signal(strategy['position'], price, rsi, bb_upper)
                                     
                                     if should_sell:
                                         # LOG COMPLETO ANTES DE VENDER
@@ -1896,38 +1884,43 @@ def export_data():
 
 async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Olá! Sou o Bot do Laboratório de Trading.\n\n"
-        "📋 *COMANDOS DISPONÍVEIS:*\n\n"
-        "📊 /status - Ver situação atual do bot\n"
-        "💰 /saldo - Ver saldo da conta\n"
-        "📈 /posicao - Ver posição aberta\n"
-        "🔍 /moedas - Ver análise de todas moedas\n"
-        "📑 /relatorio - Relatório completo\n"
-        "⚡ /comprar XRP - Forçar compra\n"
-        "💵 /converter - Converter BRL para USDT\n"
-        "🔔 /ligar - Ligar o bot\n"
-        "🔕 /desligar - Desligar o bot\n"
-        "❓ /ajuda - Ver ajuda",
+        "🤖 *Bot Modo Sandra - Ativo!*\n\n"
+        "Olá! Sou sua guarda-costas com cérebro de trader. "
+        "Vou operar com sabedoria: ganhar devagar, perder menos, e fazer repique gordo quando der!\n\n"
+        "💡 *Como posso te ajudar?*\n"
+        "• Use /ajuda para ver todos os comandos\n"
+        "• Use /status para ver o que estou analisando\n"
+        "• Use /relatorio para análise completa do mercado\n"
+        "• Ou apenas converse comigo digitando qualquer mensagem!\n\n"
+        "📊 Modo: Apostas variáveis ($11/$22/$33)\n"
+        "🛡️ Proteção: Trailing Stop ativo\n"
+        "💰 Cálculo: Lucro líquido com taxas reais",
         parse_mode='Markdown'
     )
 
 async def telegram_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *COMANDOS DO BOT:*\n\n"
-        "*Informações:*\n"
-        "/status - Mostra o que o bot está analisando\n"
-        "/saldo - Mostra seu saldo em BRL e USDT\n"
-        "/posicao - Mostra posição aberta (se houver)\n"
-        "/moedas - Análise de todas as 10 moedas\n"
+        "🤖 *BOT MODO SANDRA - COMANDOS*\n\n"
+        "📊 *Informações do Sistema:*\n"
+        "/status - O que estou analisando agora\n"
+        "/saldo - Seu saldo em BRL e USDT\n"
+        "/posicao - Posição aberta (se houver)\n"
+        "/moedas - Análise das 10 moedas\n"
         "/relatorio - Relatório completo do mercado\n"
-        "/ia - Parâmetros da IA (reset para resetar)\n\n"
-        "*Ações:*\n"
+        "/ia - Parâmetros da IA (use 'reset' para resetar)\n\n"
+        "⚡ *Ações de Trading:*\n"
         "/comprar XRP - Força compra de uma moeda\n"
         "/converter - Converte BRL para USDT\n"
         "/ligar - Liga o bot automático\n"
         "/desligar - Desliga o bot automático\n\n"
-        "*Chat:*\n"
-        "Envie qualquer mensagem para conversar com a IA!",
+        "💬 *Conversa com IA:*\n"
+        "Envie qualquer mensagem para conversar comigo!\n"
+        "Pergunte sobre o mercado, estratégias ou qualquer dúvida.\n\n"
+        "🎯 *Modo Sandra Ativo:*\n"
+        "• Apostas: $11 (normal), $22 (forte), $33 (ouro)\n"
+        "• Trailing Stop: Deixa lucro correr acima de 5%\n"
+        "• Proteção: Reduz aposta se perder 10%\n"
+        "• Taxas: Calcula lucro líquido real (0.2%)",
         parse_mode='Markdown'
     )
 
@@ -2294,7 +2287,16 @@ def run_telegram_bot():
         if TELEGRAM_CHAT_ID:
             try:
                 print(f"📨 Tentando enviar mensagem de teste para ID: {TELEGRAM_CHAT_ID}")
-                loop.run_until_complete(app_bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🤖 *Bot Reiniciado!* Estou online e pronto para conversar.", parse_mode='Markdown'))
+                welcome_msg = (
+                    "🤖 *Bot Modo Sandra Ativado!*\\n\\n"
+                    "Olá! Sou o Bot Modo Sandra, sua guarda-costas com cérebro de trader. "
+                    "Estou online e pronto para operar com sabedoria.\\n\\n"
+                    "💡 *Quer saber o que posso fazer?*\\n"
+                    "Digite /ajuda ou /help para ver todos os comandos disponíveis!\\n\\n"
+                    "📊 Status: Monitorando mercado...\\n"
+                    "🎯 Objetivo: Ganhar devagar, perder menos, repique gordo quando der!"
+                )
+                loop.run_until_complete(app_bot.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=welcome_msg, parse_mode='Markdown'))
                 print("✅ Mensagem de teste enviada com sucesso!")
             except Exception as e:
                 print(f"❌ Falha ao enviar mensagem de teste: {e}")
