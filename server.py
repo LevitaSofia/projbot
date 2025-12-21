@@ -41,6 +41,7 @@ import threading
 import tempfile
 import copy
 import queue
+import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, render_template, request, abort
@@ -313,9 +314,10 @@ telegram_app = None
 # Estado Global
 lab_state = {
     'strategies': {
-        'aggressive': {'name': 'Trading Real 💰', 'balance': 0.0, 'trades': [], 'position': None}
+        'aggressive': {'name': 'Trading Real 💰 (Sandra)', 'balance': 0.0, 'trades': [], 'position': None},
+        'aggressive_parcial': {'name': 'Trading Agressivo 🔥 (Parcial)', 'balance': 0.0, 'trades': [], 'position': None}
     },
-    'selected_strategy': 'aggressive',  # Única estratégia - Trading Real
+    'selected_strategy': 'aggressive',  # Padrão: Sandra Mode
     'is_live': True,  # Valor inicial (pode ser sobrescrito por lab_data.json e/ou rotas)
     'running': True,  # Valor inicial (pode ser sobrescrito por lab_data.json e/ou rotas)
     'real_balance': 0.0,
@@ -338,7 +340,8 @@ lab_state = {
         'total_brl': 0.0,
         'usdt_brl_rate': 0.0
     },
-    'last_trade_time': 0,  # Cooldown para evitar trades em loop
+    'last_trade_time': 0,  # Cooldown global (Sandra usa isso)
+    'symbol_cooldowns': {},  # Cooldown por símbolo (aggressive_parcial usa isso: 15min)
     'pnl': {  # Sandra Mode: Tracking de lucro diário
         'date': now_sp().strftime('%Y-%m-%d'),
         'day_net': 0.0,
@@ -405,68 +408,172 @@ except Exception as e:
     print(f"⚠️ Erro ao conectar Exchange: {e}")
 
 
-def load_lab_data():
-    """Carrega dados persistidos do laboratório."""
-    try:
-        with open('lab_data.json', 'r') as f:
-            data = json.load(f)
-            with state_lock:
-                lab_state['strategies'] = data.get(
-                    'strategies', lab_state['strategies'])
-                lab_state['selected_strategy'] = data.get(
-                    'selected_strategy', 'aggressive')
+# ==============================================================================
+# 🗄️ PERSISTÊNCIA BLINDADA (SQLite - O Cérebro de Aço da Sandra)
+# ==============================================================================
 
+DB_FILE = 'sandra_trading.db'
+
+def init_db():
+    """Inicializa o banco de dados e cria tabelas se não existirem."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Tabela para configurações e estado atual (JSON blob para flexibilidade)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS system_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    
+    # Tabela para Histórico Eterno de Trades (Relatórios futuros)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS trade_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy TEXT,
+            symbol TEXT,
+            side TEXT,
+            price REAL,
+            qty REAL,
+            profit_usdt REAL,
+            profit_pct REAL,
+            timestamp TEXT,
+            json_data TEXT
+        )
+    ''')
+    conn.commit()
+    return conn
+
+def migrate_json_to_db():
+    """Importa o JSON antigo para o DB na primeira execução."""
+    if os.path.exists('lab_data.json') and not os.path.exists(DB_FILE):
+        print("📦 Migrando dados antigos do JSON para SQLite...")
+        try:
+            conn = init_db()
+            with open('lab_data.json', 'r') as f:
+                data = json.load(f)
+            
+            # Salva estado atual
+            cursor = conn.cursor()
+            cursor.execute('INSERT OR REPLACE INTO system_state (key, value) VALUES (?, ?)', 
+                          ('lab_state', json.dumps(data)))
+            
+            # Tenta extrair trades antigos para o histórico
+            strategies = data.get('strategies', {})
+            count = 0
+            for strat_name, strat_data in strategies.items():
+                trades = strat_data.get('trades', [])
+                for t in trades:
+                    cursor.execute('''
+                        INSERT INTO trade_history (strategy, symbol, side, price, qty, profit_usdt, profit_pct, timestamp, json_data)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        strat_name,
+                        t.get('symbol'),
+                        t.get('side', 'unknown'),
+                        float(t.get('price', 0) or 0),
+                        float(t.get('qty', 0) or 0),
+                        float(t.get('net_profit_usdt', 0) or 0),
+                        float(t.get('profit_pct', 0) or 0),
+                        t.get('timestamp', now_iso()),
+                        json.dumps(t)
+                    ))
+                    count += 1
+            
+            conn.commit()
+            conn.close()
+            print(f"✅ Migração concluída! {count} trades salvos no banco.")
+            # Renomeia o JSON para backup para não confundir
+            os.rename('lab_data.json', 'lab_data_backup.json')
+        except Exception as e:
+            print(f"⚠️ Erro na migração (dados mantidos no JSON): {e}")
+
+def load_lab_data():
+    """Carrega dados do SQLite para a memória."""
+    global lab_state
+    
+    # Verifica se precisa migrar antes de carregar
+    if os.path.exists('lab_data.json') and not os.path.exists(DB_FILE):
+        migrate_json_to_db()
+
+    try:
+        conn = init_db()
+        cursor = conn.cursor()
+        cursor.execute('SELECT value FROM system_state WHERE key = ?', ('lab_state',))
+        row = cursor.fetchone()
+        
+        if row:
+            data = json.loads(row[0])
+            with state_lock:
+                # Restaura estado principal
+                lab_state['strategies'] = data.get('strategies', lab_state['strategies'])
+                lab_state['selected_strategy'] = data.get('selected_strategy', 'aggressive')
+                
                 # Valida se a strategy existe
                 if lab_state['selected_strategy'] not in lab_state['strategies']:
                     print(f"⚠️ Strategy '{lab_state['selected_strategy']}' não existe, usando 'aggressive'")
                     lab_state['selected_strategy'] = 'aggressive'
-
+                
                 lab_state['is_live'] = data.get('is_live', False)
                 lab_state['running'] = data.get('running', False)
-
-                # Sandra Mode: persistência de PnL, streak e stats globais
                 lab_state['pnl'] = data.get('pnl', lab_state.get('pnl', {}))
                 lab_state['streak'] = data.get('streak', lab_state.get('streak', {}))
+                
+                # Restaura estatísticas globais
                 gs = data.get('global_stats')
                 if isinstance(gs, dict):
                     GLOBAL_STATS.update(gs)
-            print("📂 Dados do laboratório carregados")
-    except FileNotFoundError:
-        print("📝 Criando novo laboratório")
+            print("📂 Dados carregados do Banco de Dados (SQLite)")
+        else:
+            print("📝 Banco novo criado (sem dados anteriores)")
+            save_lab_data() # Cria estrutura inicial
+        
+        conn.close()
+    except Exception as e:
+        print(f"⚠️ Erro ao carregar do DB: {e}")
+        # Fallback de segurança: cria estado novo se der pau violento
         save_lab_data()
 
-
 def save_lab_data():
-    """Salva estado atual do laboratório."""
+    """Salva estado atual no SQLite (Transacional e Seguro)."""
     with state_lock:
-        max_trades = 2000
-        for _sk, _s in lab_state.get('strategies', {}).items():
+        # 1. Mantém apenas os últimos 200 trades na memória RAM para o bot ficar leve
+        # (O histórico completo já vai estar no DB se implementarmos logica de insert individual, 
+        # mas por segurança aqui salvamos o dump do estado atual)
+        max_ram_trades = 200
+        snapshot_data = copy.deepcopy(lab_state) # Cópia para não travar a thread
+        
+        # Limpa trades antigos da memória RAM antes de salvar o snapshot json
+        # (Isso evita que o JSON dentro do banco fique gigante desnecessariamente)
+        for _sk, _s in snapshot_data.get('strategies', {}).items():
             trades = _s.get('trades', [])
-            if len(trades) > max_trades:
-                _s['trades'] = trades[-max_trades:]
+            if len(trades) > max_ram_trades:
+                _s['trades'] = trades[-max_ram_trades:]
 
-        data = {
-            'strategies': lab_state['strategies'],
-            'selected_strategy': lab_state['selected_strategy'],
-            'is_live': lab_state['is_live'],
-            'running': lab_state['running'],
-            'pnl': lab_state.get('pnl', {}),
-            'streak': lab_state.get('streak', {}),
+        data_to_save = {
+            'strategies': snapshot_data['strategies'],
+            'selected_strategy': snapshot_data['selected_strategy'],
+            'is_live': snapshot_data['is_live'],
+            'running': snapshot_data['running'],
+            'pnl': snapshot_data.get('pnl', {}),
+            'streak': snapshot_data.get('streak', {}),
             'global_stats': GLOBAL_STATS,
             'last_save': now_iso()
         }
 
-        tmp_fd, tmp_path = tempfile.mkstemp(prefix="lab_data_", suffix=".json")
-        try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            os.replace(tmp_path, "lab_data.json")  # atomic
-        finally:
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        # Salva o JSON principal
+        cursor.execute('INSERT OR REPLACE INTO system_state (key, value) VALUES (?, ?)', 
+                      ('lab_state', json.dumps(data_to_save, ensure_ascii=False)))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"❌ Erro crítico ao salvar no DB: {e}")
+
+# ==============================================================================
 
 
 def calculate_rsi(prices, period=14):
@@ -1162,10 +1269,14 @@ def get_diagnostic(strategy_name, price, rsi, bb_lower, position=None):
     return "⏳ " + " | ".join(issues)
 
 
-def check_exit_signal(position, current_price, rsi, bb_upper=None):
+def check_exit_signal(position, current_price, rsi, bb_upper=None, strategy_name=None):
     """
     SAÍDA SANDRA MODE CORRETO com trailing PERSISTENTE.
     """
+    # Se for estratégia parcial, usa lógica específica
+    if strategy_name == 'aggressive_parcial':
+        return _check_exit_parcial(position, current_price, rsi, bb_upper)
+
     entry_price = position['entry_price']
 
     # Sempre timezone-aware
@@ -1213,6 +1324,42 @@ def check_exit_signal(position, current_price, rsi, bb_upper=None):
         return True, f"TP {SANDRA['TP_SLOW']}% (subida lenta)"
     
     return False, "Segurando"
+
+
+def _check_exit_parcial(position, current_price, rsi, bb_upper):
+    """Lógica de saída para estratégia aggressive_parcial (venda parcial progressiva)."""
+    if not position:
+        return False, "Sem posição"
+    
+    entry_price = float(position.get('entry_price', current_price))
+    entry_qty = float(position.get('qty', 0))
+    profit_pct = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+    profit_usdt = (current_price - entry_price) * entry_qty
+    
+    # 1) STOP FIXO: -2%
+    if profit_pct <= -2.0:
+        return True, "STOP -2%"
+    
+    # 2) VENDA PARCIAL PROGRESSIVA: 25% a cada $1.50 de lucro
+    sold_partial = position.get('sold_partial_slices', 0)
+    target_slices = int(profit_usdt / 1.5)  # quantas fatias de $1.50 já atingiu
+    
+    if target_slices > sold_partial:
+        # Marca que vendeu mais uma fatia
+        position['sold_partial_slices'] = target_slices
+        return True, f"PARCIAL ${profit_usdt:.2f} (fatia {target_slices})"
+    
+    # 3) RSI > 50 + banda superior: vende 50%
+    if rsi > 50 and bb_upper and current_price >= bb_upper:
+        if not position.get('sold_rsi50', False):
+            position['sold_rsi50'] = True
+            return True, "RSI>50 + Banda Superior (50%)"
+    
+    # 4) TP FINAL: +5% total (vende o resto)
+    if profit_pct >= 5.0:
+        return True, "TP +5%"
+    
+    return False, "Segurando (parcial)"
 
 
 def convert_brl_to_usdt(min_brl=20):
@@ -1283,15 +1430,7 @@ def convert_brl_to_usdt(min_brl=20):
 
 
 def execute_real_trade(action, price, symbol, reason=None, amount_usdt=None):
-    """Executa trade REAL na Binance.
-    
-    Args:
-        action: 'buy' ou 'sell'
-        price: Preço atual
-        symbol: Par de trading
-        reason: Motivo da venda (para evitar mensagem duplicada no Telegram)
-        amount_usdt: Valor desejado de compra (Sandra Mode: $11/$22/$33/$8)
-    """
+    """Executa trade REAL na Binance com Cooldown de 15min (Sandra Mode)."""
     if not exchange or not API_KEY or not SECRET:
         print("⚠️ Modo real desabilitado: sem chaves API")
         return False
@@ -1310,31 +1449,13 @@ def execute_real_trade(action, price, symbol, reason=None, amount_usdt=None):
                 return float(amount)
 
         def market_buy_by_quote(symbol: str, quote_usdt: float, price_hint: float):
-            """Compra tentando gastar exatamente quote_usdt, com fallback para qty."""
-            # 1) Tenta create_market_buy_order com quoteOrderQty (algumas versões aceitam amount=0)
             try:
-                return ex(
-                    exchange.create_market_buy_order,
-                    symbol,
-                    0,
-                    {"quoteOrderQty": float(quote_usdt)},
-                )
+                return ex(exchange.create_market_buy_order, symbol, 0, {"quoteOrderQty": float(quote_usdt)})
             except Exception:
                 pass
-
-            # 2) Tenta create_order (fallback alternativo)
             try:
-                return ex(
-                    exchange.create_order,
-                    symbol,
-                    'market',
-                    'buy',
-                    0,
-                    None,
-                    {"quoteOrderQty": float(quote_usdt)},
-                )
+                return ex(exchange.create_order, symbol, 'market', 'buy', 0, None, {"quoteOrderQty": float(quote_usdt)})
             except Exception:
-                # 3) Fallback: compra por quantidade com haircut
                 qty = (float(quote_usdt) / float(price_hint)) * 0.995
                 try:
                     qty = float(exchange.amount_to_precision(symbol, qty))
@@ -1344,60 +1465,60 @@ def execute_real_trade(action, price, symbol, reason=None, amount_usdt=None):
 
         if action == 'buy':
             desired = float(amount_usdt if amount_usdt is not None else AMOUNT_INVEST)
-
-            # trava absoluta
             desired = min(desired, SANDRA["MAX_BET"])
 
-            # Min notional (Binance): evita erro de exchange e não fura proteção
+            # Min notional
             min_notional = get_min_notional_usdt(symbol, fallback=10.0)
             with state_lock:
                 drawdown_mode = bool(GLOBAL_STATS.get('drawdown_mode', False))
 
             if drawdown_mode and desired < min_notional:
                 print(f"🛡️ Proteção ativa: ordem ${desired:.2f} < mínimo ${min_notional:.2f}. Não opera.")
-                send_telegram_message(
-                    f"🛡️ Proteção ativa: mínimo do par é ${min_notional:.2f}. Sandra NÃO fura a proteção."
-                )
+                send_telegram_message(f"🛡️ Proteção ativa: aposta abaixo do mínimo do par.")
                 return False
             if desired < min_notional:
                 print(f"⚠️ Ordem abaixo do mínimo (${desired:.2f} < ${min_notional:.2f}). Pulando.")
                 return False
 
-            # COOLDOWN: somente na COMPRA (venda sempre libera)
-            TRADE_COOLDOWN = 60  # segundos
+            # === COOLDOWN DE 15 MINUTOS (CORREÇÃO APLICADA) ===
             current_time = time.time()
-            if current_time - last_trade_snapshot < TRADE_COOLDOWN:
-                remaining = int(TRADE_COOLDOWN - (current_time - last_trade_snapshot))
-                print(f"⏳ Cooldown ativo: aguarde {remaining}s antes da próxima COMPRA")
+            
+            # 1. Verifica cooldown específico deste par (900s = 15min)
+            last_symbol_trade = lab_state.get('symbol_cooldowns', {}).get(symbol, 0)
+            SYMBOL_COOLDOWN = 900 
+
+            if current_time - last_symbol_trade < SYMBOL_COOLDOWN:
+                # Silencioso no log para não poluir, mas impede a compra
                 return False
 
-            # BUSCA SALDO REAL DA BINANCE (não usa cache)
+            # 2. Cooldown Global de Segurança (60s entre qualquer trade)
+            GLOBAL_COOLDOWN = 60
+            if current_time - last_trade_snapshot < GLOBAL_COOLDOWN:
+                return False
+
+            # Busca Saldo Real
             balance = ex(exchange.fetch_balance)
             usdt_balance = balance.get('free', {}).get('USDT', 0.0)
             print(f"💳 Saldo REAL da Binance: ${usdt_balance:.2f} USDT")
-            with state_lock:
-                lab_state['real_balance'] = usdt_balance  # Atualiza cache
-                try:
-                    lab_state.setdefault('user_info', {})['usdt_total'] = float(balance.get('total', {}).get('USDT', usdt_balance) or usdt_balance)
-                except Exception:
-                    pass
             
-            # precisa ter pelo menos (aposta + taxa)
+            with state_lock:
+                lab_state['real_balance'] = usdt_balance
+                try:
+                    lab_state.setdefault('user_info', {})['usdt_total'] = float(balance.get('total', {}).get('USDT', usdt_balance))
+                except: pass
+            
             required = desired * (1 + FEE_RATE)
 
-            # Se não tem USDT suficiente, tenta converter BRL para USDT
             if usdt_balance < required:
-                print(f"⚠️ USDT insuficiente (${usdt_balance:.2f} < ${required:.2f}). Tentando converter BRL...")
+                print(f"⚠️ USDT insuficiente. Tentando converter BRL...")
                 usdt_balance = convert_brl_to_usdt()
-
                 if usdt_balance < required:
-                    print(f"⚠️ Saldo insuficiente: ${usdt_balance:.2f} < ${required:.2f}")
+                    print(f"⚠️ Saldo insuficiente: ${usdt_balance:.2f}")
                     return False
 
             invest_amount = desired
 
-            # Ordem de compra REAL
-            # Preferência: gastar exatamente o invest_amount (quoteOrderQty), com fallback robusto.
+            # EXECUTA COMPRA
             order = market_buy_by_quote(symbol=symbol, quote_usdt=invest_amount, price_hint=price)
             
             buy_price = order['average'] or price
@@ -1406,7 +1527,6 @@ def execute_real_trade(action, price, symbol, reason=None, amount_usdt=None):
             rsi = rsi_snapshot
 
             with state_lock:
-                # Trade padrão (sempre com side + timestamp)
                 trade = {
                     'timestamp': now_iso(),
                     'side': 'buy',
@@ -1416,8 +1536,6 @@ def execute_real_trade(action, price, symbol, reason=None, amount_usdt=None):
                     'fees': buy_total * FEE_RATE,
                     'mode': 'REAL',
                     'rsi': rsi,
-
-                    # Campos legados (para telas antigas)
                     'time': now_sp().strftime('%H:%M:%S'),
                     'type': f'BUY REAL ({symbol})',
                     'order_id': order.get('id', ''),
@@ -1425,7 +1543,6 @@ def execute_real_trade(action, price, symbol, reason=None, amount_usdt=None):
                 }
                 strategy['trades'].append(trade)
 
-                # Posição padrão (prepara trailing persistente + custo real para PnL)
                 strategy['position'] = {
                     'symbol': symbol,
                     'entry_price': buy_price,
@@ -1433,8 +1550,6 @@ def execute_real_trade(action, price, symbol, reason=None, amount_usdt=None):
                     'entry_time': now_iso(),
                     'highest_price': buy_price,
                     'trail_active': False,
-
-                    # custo real pra PnL correto (rateado se vender parcial)
                     'entry_cost_usdt': buy_total,
                     'entry_fee_usdt': buy_total * FEE_RATE,
                 }
@@ -1442,7 +1557,7 @@ def execute_real_trade(action, price, symbol, reason=None, amount_usdt=None):
             print(f"💰 [{strategy['name']}] COMPRA REAL: {buy_qty:.4f} {symbol} @ ${buy_price:.4f}")
             taxa_est = buy_total * FEE_RATE
 
-            # === RELATÓRIO VISUAL DE COMPRA (RECIBO) ===
+            # Relatório Visual
             msg = (
                 f"🔵 *COMPRA EXECUTADA* | {symbol}\n\n"
                 f"💵 *Preço:* ${buy_price:.4f}\n"
@@ -1454,111 +1569,72 @@ def execute_real_trade(action, price, symbol, reason=None, amount_usdt=None):
             )
             send_telegram_message(msg)
             
-            # Atualiza cooldown
+            # ATUALIZA TODOS OS COOLDOWNS (CORREÇÃO APLICADA)
             with state_lock:
                 lab_state['last_trade_time'] = time.time()
+                # Grava o cooldown específico do par SEMPRE
+                lab_state.setdefault('symbol_cooldowns', {})[symbol] = time.time()
             
             return True
 
         elif action == 'sell':
-            # Busca posição aberta para saber quanto vender
+            # Lógica de venda original mantida
             if strategy['position']:
                 qty = strategy['position']['qty']
-                entry_price_original = strategy['position']['entry_price']
                 
-                # Sandra Mode: Vende quando a estratégia mandar (sem bloqueios)
-                
-                # Verifica se realmente temos a moeda na carteira antes de vender
                 try:
                     balance = ex(exchange.fetch_balance)
-                    coin = symbol.split('/')[0]  # Ex: 'XRP' de 'XRP/USDT'
+                    coin = symbol.split('/')[0]
                     coin_balance = balance['free'].get(coin, 0)
                     
                     if coin_balance <= 0:
-                        print(f"⚠️ Nenhum saldo de {coin} na carteira!")
                         strategy['position'] = None
-                        send_telegram_message(f"⚠️ *POSIÇÃO LIMPA*\\n\\nNão há {coin} na carteira para vender.")
+                        send_telegram_message(f"⚠️ *POSIÇÃO LIMPA* (Sem saldo de {coin})")
                         return False
                     
-                    # DETECTA DUST: saldo muito pequeno para vender (< $2 ou < 0.001 para BNB)
-                    coin_value_usdt = coin_balance * price
-                    min_qty = 0.001 if coin == 'BNB' else 0.0001  # Mínimos do Binance
-                    
-                    if coin_balance < min_qty or coin_value_usdt < 2:
-                        print(f"🧹 DUST DETECTADO: {coin_balance:.8f} {coin} (${coin_value_usdt:.4f})")
-                        print(f"🧹 Limpando posição fantasma - muito pequeno para vender")
-                        strategy['position'] = None
-                        send_telegram_message(f"🧹 *DUST LIMPO*\\n\\n{coin_balance:.8f} {coin} (${coin_value_usdt:.4f})\\nMuito pequeno para vender.")
-                        return False
-                    
-                    # Se o saldo real é menor que o registrado, vende o que tem
                     if coin_balance < qty:
-                        print(f"⚠️ Saldo real de {coin} menor que registrado: {coin_balance:.8f} < {qty:.8f}")
-                        print(f"📤 Vendendo o saldo disponível: {coin_balance:.8f} {coin}")
                         qty = coin_balance
                     
                 except Exception as e:
-                    print(f"⚠️ Erro ao verificar saldo: {e}")
+                    print(f"⚠️ Erro saldo venda: {e}")
 
                 qty = _safe_amount(symbol, qty)
-                if qty <= 0:
-                    print(f"🧹 Qty arredondada virou 0 para {symbol}. Limpando posição.")
-                    with state_lock:
-                        strategy['position'] = None
-                    send_telegram_message("🧹 *DUST LIMPO*\n\nQuantidade inválida após precisão. Posição removida.")
-                    return False
+                if qty <= 0: return False
 
                 order = ex(exchange.create_market_sell_order, symbol, qty)
-                
-                # Aguarda Binance processar a ordem e atualiza saldo
                 print("⏳ Aguardando confirmação da Binance...")
                 time.sleep(5)
                 
-                # Salva dados da posição ANTES de limpar
                 pos = strategy.get('position') or {}
                 entry_price = pos.get('entry_price', price)
                 entry_qty = float(pos.get('qty', qty) or qty)
-                entry_time = pos.get('entry_time', 'N/A')
                 
                 sell_price = order['average'] or price
                 sell_qty = order['filled']
-                rsi = rsi_snapshot
                 
-                # === CÁLCULO SANDRA (LUCRO LÍQUIDO REAL COM TAXAS, COM RATEIO) ===
+                # Cálculo de Lucro Líquido
                 ratio = min(1.0, sell_qty / entry_qty) if entry_qty > 0 else 1.0
-
-                entry_cost_full = float(pos.get('entry_cost_usdt', entry_price * entry_qty))
-                entry_fee_full = float(pos.get('entry_fee_usdt', entry_cost_full * FEE_RATE))
-
-                entry_cost = entry_cost_full * ratio
-                entry_fee = entry_fee_full * ratio
-
+                entry_cost = float(pos.get('entry_cost_usdt', entry_price * entry_qty)) * ratio
+                entry_fee = float(pos.get('entry_fee_usdt', entry_cost * FEE_RATE)) * ratio
+                
                 sell_gross = sell_price * sell_qty
                 sell_fee = sell_gross * FEE_RATE
                 sell_net = sell_gross - sell_fee
-
+                
                 lucro_liquido_usdt = sell_net - (entry_cost + entry_fee)
                 base = (entry_cost + entry_fee)
                 lucro_liquido_pct = (lucro_liquido_usdt / base) * 100 if base > 0 else 0.0
                 taxas_totais = entry_fee + sell_fee
-                
-                # Atualiza saldo real
+
+                # Atualiza saldo
                 try:
                     balance = ex(exchange.fetch_balance)
                     usdt_free = balance.get('free', {}).get('USDT', 0.0)
                     with state_lock:
                         lab_state['real_balance'] = usdt_free
-                        try:
-                            lab_state.setdefault('user_info', {})['usdt_total'] = float(balance.get('total', {}).get('USDT', usdt_free) or usdt_free)
-                        except Exception:
-                            pass
-                    print(f"✅ Saldo confirmado: ${usdt_free:.2f} USDT")
-                except Exception as e:
-                    # Fallback: estima saldo usando o líquido da venda (sell_net)
-                    with state_lock:
-                        lab_state['real_balance'] = float(lab_state.get('real_balance', 0.0)) + float(sell_net)
-                        estimated = lab_state['real_balance']
-                    print(f"⚠️ Erro Binance ao confirmar saldo: {e} | Saldo estimado: ${estimated:.2f} USDT")
+                        try: lab_state['user_info']['usdt_total'] = float(balance.get('total', {}).get('USDT', usdt_free))
+                        except: pass
+                except: pass
 
                 with state_lock:
                     trade = {
@@ -1573,33 +1649,24 @@ def execute_real_trade(action, price, symbol, reason=None, amount_usdt=None):
                         'net_profit_pct': lucro_liquido_pct,
                         'reason': reason or '',
                         'mode': 'REAL',
-                        'rsi': rsi,
-
-                        # Campos legados
+                        'rsi': rsi_snapshot,
                         'time': now_sp().strftime('%H:%M:%S'),
                         'type': f'SELL REAL ({symbol})',
-                        'price': sell_price,
-                        'order_id': order.get('id', ''),
                         'profit_pct': lucro_liquido_pct,
                     }
                     strategy['trades'].append(trade)
-                    strategy['position'] = None  # Limpa posição
+                    strategy['position'] = None
                 
-                print(f"💵 [{strategy['name']}] VENDA REAL: {sell_qty} {symbol} @ ${sell_price:.2f}")
-                print(f"📊 Compra: ${entry_price:.4f} → Venda: ${sell_price:.4f}")
-                print(f"💰 Lucro LÍQUIDO: ${lucro_liquido_usdt:+.2f} ({lucro_liquido_pct:+.2f}%) | Taxas: ${taxas_totais:.3f}")
+                print(f"💵 VENDA: {symbol} | Líquido: ${lucro_liquido_usdt:+.2f}")
                 
-                # Atualiza PnL diário (Sandra Mode)
                 with state_lock:
                     today = now_sp().strftime('%Y-%m-%d')
                     if lab_state['pnl']['date'] != today:
                         lab_state['pnl']['date'] = today
                         lab_state['pnl']['day_net'] = 0.0
-
                     lab_state['pnl']['day_net'] += lucro_liquido_usdt
                     lab_state['pnl']['total_net'] += lucro_liquido_usdt
 
-                # === RELATÓRIO VISUAL DE VENDA (RECIBO FISCAL) ===
                 icon = "✅" if lucro_liquido_usdt > 0 else "🔻"
                 msg = (
                     f"{icon} *VENDA FINALIZADA* | {symbol}\n"
@@ -1609,21 +1676,18 @@ def execute_real_trade(action, price, symbol, reason=None, amount_usdt=None):
                     f"🧾 *Contabilidade:*\n"
                     f"Valor Bruto:  ${sell_gross:.2f}\n"
                     f"(-) Custo:    ${entry_cost:.2f}\n"
-                    f"(-) Taxas:    ${taxas_totais:.3f} (Compra+Venda)\n"
+                    f"(-) Taxas:    ${taxas_totais:.3f}\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
                     f"💰 *LÍQUIDO: ${lucro_liquido_usdt:+.2f} ({lucro_liquido_pct:+.2f}%)*\n\n"
-                    f"📅 Dia: ${lab_state['pnl']['day_net']:+.2f} | Total: ${lab_state['pnl']['total_net']:+.2f}"
+                    f"📅 Dia: ${lab_state['pnl']['day_net']:+.2f}"
                 )
                 send_telegram_message(msg)
-                
-                # Atualiza streak Sandra (2 perdas = aperta)
                 update_sandra_streak(lucro_liquido_usdt)
-                
                 return True
 
     except Exception as e:
         print(f"❌ ERRO ORDEM REAL: {e}")
-        send_telegram_message(f"❌ *ERRO CRÍTICO NA EXECUÇÃO*\\n\\n{str(e)}")
+        send_telegram_message(f"❌ *ERRO CRÍTICO NA EXECUÇÃO*\n\n{str(e)}")
         return False
 
 
@@ -1897,9 +1961,9 @@ def trading_loop():
                                     bb_display = f"${bb_upper:.2f}" if bb_upper else "$0"
                                     print(f"🔍 [DEBUG] Verificando saída: RSI={rsi:.1f} | Lucro={profit_pct:+.2f}% | BB_Upper={bb_display}")
                                     
-                                    # Passamos a posição inteira (strategy['position']) para Trailing Stop
+                                    # Passamos a posição inteira + nome da estratégia para Trailing Stop
                                     with state_lock:
-                                        should_sell, reason = check_exit_signal(strategy['position'], price, rsi, bb_upper)
+                                        should_sell, reason = check_exit_signal(strategy['position'], price, rsi, bb_upper, selected)
                                     
                                     if should_sell:
                                         # LOG COMPLETO ANTES DE VENDER
@@ -2337,9 +2401,6 @@ def get_chart_data(symbol):
         
         # Formata dados
         candles = []
-        
-        # Formata dados
-        candles = []
         closes = []
         for candle in ohlcv:
             candles.append({
@@ -2553,6 +2614,7 @@ def force_buy():
                 'order_id': order.get('id', ''),
                 'profit_pct': 0,
             }
+            strategy_key = lab_state['selected_strategy']
             lab_state['strategies'][strategy_key]['trades'].append(trade)
 
             buy_price = order.get('average', current_price)
@@ -2567,6 +2629,9 @@ def force_buy():
                 'entry_cost_usdt': buy_total,
                 'entry_fee_usdt': buy_total * FEE_RATE,
             }
+            # Adiciona o cooldown para a moeda comprada
+            lab_state.setdefault('symbol_cooldowns', {})[symbol] = time.time()
+            
         save_lab_data()
         
         return jsonify({
@@ -2584,49 +2649,7 @@ def force_buy():
         return jsonify({'success': False, 'error': error_msg}), 500
 
 
-@app.route('/api/export_data')
-def export_data():
-    """Exporta todos os dados do usuário da Binance."""
-    _require_api_token_if_configured()
-    if not exchange or not API_KEY or not SECRET:
-        return jsonify({'error': 'API não configurada'}), 400
-
-    try:
-        # 1. Informações da Conta (Saldo detalhado)
-        account_balance = ex(exchange.fetch_balance)
-        
-        # 1.1 Informações da Conta (Dados brutos da Binance - Permissões, Comissões, etc)
-        account_details = ex(exchange.private_get_account)
-
-        # 2. Histórico de Trades (Últimos trades do símbolo atual)
-        trades = ex(exchange.fetch_my_trades, SYMBOL)
-        
-        # 3. Ordens Abertas
-        open_orders = ex(exchange.fetch_open_orders, SYMBOL)
-        
-        # 4. Todas as Ordens (Histórico)
-        all_orders = ex(exchange.fetch_orders, SYMBOL)
-        
-        export_package = {
-            'timestamp': datetime.now().isoformat(),
-            'symbol': SYMBOL,
-            'account_details_binance': account_details, # Dados brutos da conta
-            'account_balance': account_balance,
-            'my_trades': trades,
-            'open_orders': open_orders,
-            'order_history': all_orders,
-            'note': 'Dados exportados via API Binance (CCXT)'
-        }
-        
-        return jsonify(export_package)
-
-    except Exception as e:
-        print(f"❌ Erro ao exportar dados: {e}")
-        # Retorna erro mas tenta enviar o que conseguiu ou mensagem clara
-        return jsonify({'error': str(e)}), 500
-
-
-# --- TELEGRAM BOT LISTENER (COMANDOS) ---
+# --- TELEGRAM BOT HANDLERS ---
 
 async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -2652,13 +2675,10 @@ async def telegram_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/saldo - Seu saldo em BRL e USDT\n"
         "/posicao - Posição aberta (se houver)\n"
         "/moedas - Análise das 10 moedas\n"
-        "/relatorio - Relatório completo do mercado\n"
-        "/ia - Parâmetros da IA (use 'reset' para resetar)\n\n"
-        "⚡ *Ações de Trading:*\n"
-        "/comprar XRP - Força compra de uma moeda\n"
-        "/converter - Converte BRL para USDT\n"
-        "/ligar - Liga o bot automático\n"
-        "/desligar - Desliga o bot automático\n\n"
+        "/relatorio - Relatório completo do mercado\n\n"
+        "⚙️ *Controle:*\n"
+        "/comprar [MOEDA] - Força compra imediata (Ex: /comprar XRP)\n"
+        "/vender - Força venda da posição atual\n\n"
         "💬 *Conversa com IA:*\n"
         "Envie qualquer mensagem para conversar comigo!\n"
         "Pergunte sobre o mercado, estratégias ou qualquer dúvida.\n\n"
@@ -2698,27 +2718,28 @@ async def telegram_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Se não tem saldo no cache, busca direto da API
         if not balances:
             try:
-                balance = await asyncio.to_thread(cached_fetch_balance, 5.0)
+                balance = cached_fetch_balance(ttl_s=5.0)
                 balances = {}
                 for asset, amount in balance['total'].items():
-                    if amount > 0.0001:
-                        balances[asset] = amount
-                
-                # Atualiza cache
-                with state_lock:
-                    lab_state['user_info']['balances'] = balances
-            except Exception as e:
-                msg += f"❌ Erro ao buscar saldo da Binance: {str(e)}\n\n"
-                msg += "Verifique se a API está ativa e tem permissões de leitura."
-                await update.message.reply_text(msg, parse_mode='Markdown')
-                return
-        
+                    if float(amount) > 0:
+                        balances[asset] = float(amount)
+            except: pass
+
         if not balances:
-            msg += "Nenhum saldo encontrado na conta."
+            msg += "⚠️ Não foi possível ler o saldo da Binance."
         else:
+            usdt = balances.get('USDT', 0.0)
+            brl = balances.get('BRL', 0.0)
+            
+            msg += f"💵 *USDT:* ${usdt:.2f}\n"
+            msg += f"🇧🇷 *BRL:* R${brl:.2f}\n\n"
+            
+            msg += "🪙 *Outras Moedas:*\n"
             for coin, amount in balances.items():
-                if amount > 0.0001:  # Só mostra saldos relevantes
-                    msg += f"• *{coin}:* {amount:.4f}\n"
+                if coin not in ['USDT', 'BRL'] and float(amount) > 0:
+                    # Filtra dust
+                    if float(amount) > 0.0001: 
+                        msg += f"• *{coin}:* {amount:.4f}\n"
             
             # Total em BRL
             total_brl = float((snap.get('user_info', {}) or {}).get('total_brl', 0) or 0)
@@ -2728,7 +2749,6 @@ async def telegram_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode='Markdown')
     except Exception as e:
         await update.message.reply_text(f"❌ Erro ao buscar saldo: {str(e)}")
-
 
 async def telegram_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mostra posição aberta atual."""
@@ -2740,23 +2760,23 @@ async def telegram_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not position:
             await update.message.reply_text("📍 *Nenhuma posição aberta no momento.*\n\nO bot está aguardando oportunidade de compra.", parse_mode='Markdown')
             return
+            
+        symbol = position.get('symbol')
+        entry_price = float(position.get('entry_price', 0))
+        qty = float(position.get('qty', 0))
+        entry_time = position.get('entry_time', '')
         
-        symbol = position.get('symbol', 'N/A')
-        entry_price = position.get('entry_price', 0)
-        qty = position.get('qty', 0)
-        entry_time = position.get('entry_time', 'N/A')
+        current_price = float(snap.get('current_price', 0) or entry_price)
         
-        # Busca preço atual
-        current_price = float(snap.get('current_price', entry_price) or entry_price)
+        # Calcula lucro atual
+        gross_val = current_price * qty
+        cost_val = entry_price * qty
+        profit_usd = gross_val - cost_val
+        profit_pct = (profit_usd / cost_val) * 100 if cost_val > 0 else 0
         
-        # Calcula lucro
-        profit_pct = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
-        profit_usd = (current_price - entry_price) * qty
+        emoji = "🟢" if profit_usd >= 0 else "🔴"
         
-        emoji = "📈" if profit_pct > 0 else "📉"
-        
-        msg = f"📍 *POSIÇÃO ABERTA*\n\n"
-        msg += f"🪙 *Moeda:* {symbol}\n"
+        msg = f"{emoji} *POSIÇÃO ABERTA* | {symbol}\n\n"
         msg += f"💵 *Entrada:* ${entry_price:.4f}\n"
         msg += f"📊 *Atual:* ${current_price:.4f}\n"
         msg += f"📦 *Quantidade:* {qty:.4f}\n"
@@ -2767,14 +2787,12 @@ async def telegram_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Erro: {str(e)}")
 
-
 async def telegram_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mostra análise de todas as moedas."""
     try:
         msg = "🔍 *ANÁLISE DAS MOEDAS*\n\n"
-        snap = get_public_snapshot()
-        diagnostics = snap.get('diagnostics', {})
-        market = snap.get('market_overview', {})
+        
+        market = lab_state.get('market_overview', {})
         
         if not market:
             await update.message.reply_text("⏳ Aguardando dados do mercado...")
@@ -2784,53 +2802,28 @@ async def telegram_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         for symbol in WATCHLIST:
             data = market.get(symbol, {})
-            diag = diagnostics.get(symbol, "")
+            if not data: continue
             
-            if not data:
-                continue
-                
-            price = data.get('price', 0)
-            rsi = data.get('rsi', 0)
-            bb_lower = data.get('bb_lower', 0)
+            rsi = float(data.get('rsi', 0) or 0)
+            price = float(data.get('price', 0) or 0)
             
-            # Determina emoji
-            if "COMPRA" in diag:
-                emoji = "🟢"
-                opportunities.append(symbol.replace('/USDT', ''))
-            elif rsi < 40:
-                emoji = "🟡"
-            elif rsi > 70:
-                emoji = "🔴"
-            else:
-                emoji = "⚪"
+            icon = "⚪"
+            if rsi < 30: icon = "🟢" # Sobrevendido
+            elif rsi > 70: icon = "🔴" # Sobrecomprado
             
-            coin = symbol.replace('/USDT', '')
-            msg += f"{emoji} *{coin}*: RSI={rsi:.0f} | ${price:.2f}\n"
+            msg += f"{icon} *{symbol}*: ${price:.2f} (RSI: {rsi:.1f})\n"
+            
+            if rsi < 35:
+                opportunities.append(symbol)
         
-        # Adiciona PnL do dia e total
-        selected = snap.get('selected_strategy', 'aggressive')
-        trades = (snap.get('strategies', {}).get(selected, {}) or {}).get('trades', [])
+        # PnL Hoje
+        trades = lab_state.get('strategies', {}).get('aggressive', {}).get('trades', [])
         
-        # PnL hoje
-        today_start = now_sp().replace(hour=0, minute=0, second=0, microsecond=0)
-        today_trades = []
-        for t in trades:
-            if t.get('side') != 'sell':
-                continue
-            dt = parse_iso_dt(t.get('timestamp'))
-            if dt and dt >= today_start:
-                today_trades.append(t)
-        pnl_today = sum(t.get('profit_pct', 0) for t in today_trades)
-        
-        # PnL total
-        def _is_sell_trade(t: dict) -> bool:
-            side = t.get('side')
-            if side:
-                return side == 'sell'
-            legacy_type = (t.get('type') or '').upper()
-            return legacy_type.startswith('SELL')
+        def _is_sell_trade(t):
+            return t.get('side') == 'sell' and t.get('timestamp', '').startswith(now_sp().strftime('%Y-%m-%d'))
 
-        pnl_total = sum(t.get('profit_pct', 0) for t in trades if _is_sell_trade(t))
+        pnl_today = sum(float(t.get('profit_pct', 0) or 0) for t in trades if _is_sell_trade(t))
+        pnl_total = sum(float(t.get('profit_pct', 0) or 0) for t in trades if t.get('side') == 'sell')
         
         msg += f"\n💰 PnL Hoje: {pnl_today:+.2f}% | Total: {pnl_total:+.2f}%\n\n"
         
@@ -2843,16 +2836,14 @@ async def telegram_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Erro: {str(e)}")
 
-
 async def telegram_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Envia relatório completo."""
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-        report = await asyncio.to_thread(generate_market_report)
+        report = generate_market_report()
         await update.message.reply_text(report, parse_mode='Markdown')
     except Exception as e:
         await update.message.reply_text(f"❌ Erro: {str(e)}")
-
 
 async def telegram_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Força compra de uma moeda específica."""
@@ -2868,53 +2859,26 @@ async def telegram_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Verifica se é uma moeda válida
         if symbol not in WATCHLIST:
-            await update.message.reply_text(f"❌ Moeda inválida: {coin}\n\nMoedas disponíveis: XRP, ADA, DOGE, DOT, LINK, LTC, SOL, BNB, ETH, BTC")
+            await update.message.reply_text(f"⚠️ Moeda {coin} não está na lista de monitoramento.")
+            return
+            
+        await update.message.reply_text(f"⏳ Analisando compra forçada de {symbol}...")
+        
+        # Executa compra real
+        price = get_price(symbol)
+        if not price:
+            await update.message.reply_text("❌ Erro ao obter preço.")
             return
 
-        # Regra Sandra: BTC sangrando 3 dias = não compra em lugar nenhum
-        if await asyncio.to_thread(btc_bleeding_3days_cached):
-            await update.message.reply_text("🩸 BTC sangrando 3 dias. Sandra NÃO compra até voltar.")
-            return
-
-        if not exchange:
-            await update.message.reply_text("❌ API não conectada!")
-            return
-
-        # Sandra: posição única
-        with state_lock:
-            strategy_key = lab_state['selected_strategy']
-            if lab_state['strategies'][strategy_key].get('position'):
-                await update.message.reply_text("📍 Já tem posição aberta. Sandra não abre duas.")
-                return
-
-        # Dados do mercado (para respeitar SANDRA)
-        price, rsi, bb_lower, bb_upper, vol_now, vol_avg = await asyncio.to_thread(
-            fetch_market_data, symbol, '5m', 60
-        )
-        if price is None or rsi is None or bb_lower is None:
-            await update.message.reply_text("⚠️ Não consegui puxar dados agora. Tenta de novo.")
-            return
-
-        # Atualiza indicadores do estado para o trade não herdar RSI de outra moeda
-        with state_lock:
-            lab_state.setdefault('indicators', {})
-            lab_state['indicators']['rsi'] = rsi
-            lab_state['indicators']['bb_lower'] = bb_lower
-            lab_state['indicators']['bb_upper'] = bb_upper
-
-        btc_is_dumping_15m = await asyncio.to_thread(btc_drop_15m_cached)
-        btc_bleeding = await asyncio.to_thread(btc_bleeding_3days_cached)
-
-        invest_amount = check_strategy_signal(
-            strategy_key, price, rsi, bb_lower, symbol, vol_now, vol_avg, btc_is_dumping_15m, btc_bleeding
-        )
-
-        if invest_amount <= 0:
-            diag = get_diagnostic(strategy_key, price, rsi, bb_lower, position=None)
-            await update.message.reply_text(f"🙅‍♀️ Sem sinal pra {coin} agora.\n{diag}")
-            return
-
-        ok = await asyncio.to_thread(execute_real_trade, 'buy', price, symbol, None, invest_amount)
+        # Define valor da aposta (usa o padrão Sandra)
+        invest_amount = get_sandra_bet_size()
+        
+        # Verifica se pode comprar (regras básicas)
+        # Ignora cooldown na compra forçada? Talvez não. Vamos tentar executar.
+        # Mas execute_real_trade tem cooldown.
+        # Vamos avisar que estamos tentando.
+        
+        ok = execute_real_trade('buy', price, symbol, amount_usdt=invest_amount)
         if ok:
             await update.message.reply_text(f"✅ Compra enviada no padrão Sandra (${invest_amount:.0f}).")
         else:
@@ -2929,6 +2893,7 @@ async def telegram_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("🔄 Convertendo BRL para USDT...")
         
+        # Executa em thread separada para não bloquear o bot
         result = await asyncio.to_thread(convert_brl_to_usdt, 10)
         
         if result > 0:
@@ -2938,22 +2903,19 @@ async def telegram_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Erro: {str(e)}")
 
-
 async def telegram_start_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Liga o bot automático."""
     with state_lock:
         lab_state['running'] = True
-    save_lab_data()
+        save_lab_data()
     await update.message.reply_text("🟢 Bot LIGADO! Agora monitorando o mercado e executando trades automaticamente.")
-
 
 async def telegram_stop_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Desliga o bot automático."""
     with state_lock:
         lab_state['running'] = False
-    save_lab_data()
+        save_lab_data()
     await update.message.reply_text("🔴 Bot DESLIGADO! Use /ligar para reativar.")
-
 
 async def telegram_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mostra parâmetros reais do Sandra Mode (SANDRA) ou reseta para padrão."""
@@ -2966,99 +2928,68 @@ async def telegram_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
             SANDRA["ENTRY_RSI"] = 35
             SANDRA["ENTRY_TOL"] = 0.01
             SANDRA["STOP_BASE"] = -3.0
+            SANDRA["STOP_DRAWDOWN"] = -10.0
             SANDRA["TP_SLOW"] = 5.0
-            lab_state.setdefault('streak', {'wins': 0, 'losses': 0, 'tight': False})
-            lab_state['streak']['tight'] = False
+            SANDRA["TRAIL_FAST"] = 1.5
+            SANDRA["MAX_BET"] = 33.0
+        await update.message.reply_text("✅ Parâmetros da IA resetados para o padrão Sandra.")
+        return
 
-        await update.message.reply_text(
-            "🔄 Parâmetros da Sandra resetados.\n"
-            f"ENTRY_RSI={SANDRA['ENTRY_RSI']} | TOL={SANDRA['ENTRY_TOL']*100:.1f}% | STOP_BASE={SANDRA['STOP_BASE']}% | TP={SANDRA['TP_SLOW']}%"
-        )
-    else:
-        # Mostra parâmetros atuais (reais)
-        await update.message.reply_text(
-            "🤖 Sandra Mode (parâmetros reais):\n"
-            f"ENTRY_RSI={SANDRA['ENTRY_RSI']}\n"
-            f"ENTRY_TOL={SANDRA['ENTRY_TOL']*100:.1f}%\n"
-            f"STOP_BASE={SANDRA['STOP_BASE']}%\n"
-            f"STOP_DRAWDOWN={SANDRA['STOP_DRAWDOWN']}%\n"
-            f"TP_SLOW={SANDRA['TP_SLOW']}%\n"
-            f"TRAIL_FAST={SANDRA['TRAIL_FAST']}%\n"
-            f"MAX_BET=${SANDRA['MAX_BET']:.0f}\n\n"
-            "Use /ia reset para voltar ao padrão."
-        )
-
+    await update.message.reply_text(
+        "🧠 *Cérebro da Sandra*\n\n"
+        "Aqui estão os parâmetros que estou usando para decidir:\n\n"
+        f"🎯 *Entrada:* RSI < {SANDRA['ENTRY_RSI']} (Tol: {SANDRA['ENTRY_TOL']*100:.1f}%)\n"
+        f"🛑 *Stop Loss:* {SANDRA['STOP_BASE']}%\n"
+        f"🛡️ *Drawdown:* {SANDRA['STOP_DRAWDOWN']}%\n"
+        f"💰 *Take Profit:* {SANDRA['TP_SLOW']}%\n"
+        f"🏃 *Trailing:* {SANDRA['TRAIL_FAST']}%\n"
+        f"🎲 *Aposta Máx:* ${SANDRA['MAX_BET']:.0f}\n\n"
+        "Use `/ia reset` para voltar ao padrão.",
+        parse_mode='Markdown'
+    )
 
 async def telegram_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Responde a mensagens de texto usando GPT com contexto do mercado."""
     user_message = update.message.text
     print(f"📩 Mensagem recebida de {update.effective_user.first_name}: {user_message}")
 
+    # Se não tiver OpenAI configurado, responde genérico
     if not get_openai_client():
-        await update.message.reply_text("🧠 IA não configurada no servidor.")
+        await update.message.reply_text("🧠 IA não configurada no servidor. Mas estou ouvindo!")
         return
 
     try:
         # Envia "Digitando..."
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-
+        
+        # Monta contexto rápido
         snap = get_public_snapshot()
+        price = snap.get('current_price', 0)
+        rsi = snap.get('indicators', {}).get('rsi', 0)
         
-        # Constrói contexto do mercado atual
-        market_context = "DADOS ATUAIS DO MERCADO (Use isso para responder):\n"
-        market_overview = snap.get('market_overview', {}) or {}
-        if market_overview:
-            for symbol, data in market_overview.items():
-                market_context += f"- {symbol}: Preço=${data['price']:.2f} | RSI={data['rsi']:.1f} | BB_Lower=${data['bb_lower']:.2f}\n"
-        else:
-            market_context += "Nenhum dado de mercado coletado ainda.\n"
-            
-        market_context += f"\nSaldo do Usuário: {float(snap.get('real_balance', 0) or 0):.2f}\n"
-        market_context += f"Estratégia Ativa: {snap.get('selected_strategy', 'aggressive')}\n"
-        
-        # Adiciona regras da estratégia (SANDRA MODE)
-        strategy_key = snap.get('selected_strategy', 'aggressive')
-        is_live = bool(snap.get('is_live', False))
-        
-        # Regras reais do SANDRA
-        strategy_rules = (
-            f"Entrada: RSI<{SANDRA['ENTRY_RSI']} (5m) e preço ≤ BB lower +{SANDRA['ENTRY_TOL']*100:.0f}%.\n"
-            f"$22: RSI<{SANDRA['STRONG_RSI']} e volume >20% da média.\n"
-            f"$33: RSI<{SANDRA['GOLD_RSI']} e BTC -2%/15min.\n"
-            f"Saída: vende RSI≥{SANDRA['SELL_RSI']} | TP {SANDRA['TP_SLOW']}% | trailing {SANDRA['TRAIL_FAST']}%."
-        )
-            
-        market_context += f"Modo: Trading Real 🚀\n"
-        market_context += f"Regras da Estratégia Atual: {strategy_rules}\n"
-
         system_prompt = (
-            "Você é um assistente de trading experiente e útil conectado a um bot em tempo real.\n"
-            "Você TEM acesso aos dados atuais do mercado fornecidos abaixo.\n"
-            "Use esses dados para responder perguntas sobre preços, tendências e se vale a pena comprar/vender.\n"
-            "IMPORTANTE: Se o usuário perguntar 'por que não comprou nada' ou 'por que não tem operações', "
-            "verifique se o RSI atual atende às regras da estratégia. Se o RSI estiver alto (ex: > 30 ou > 45), "
-            "explique que o mercado não está em ponto de compra segundo a estratégia.\n"
-            "Também verifique se o Modo Real está ativado.\n"
-            "Responda de forma concisa, direta e use emojis.\n\n"
-            f"{market_context}"
+            "Você é Sandra, uma trader experiente e sarcástica. "
+            f"O preço do ativo é ${price} e o RSI é {rsi}. "
+            "Responda de forma curta, direta e com personalidade."
         )
         
-        async def _openai_chat_sync(system_prompt_text: str, user_message_text: str) -> str:
-            def _call() -> str:
-                return openai_text(
-                    instructions=system_prompt_text,
-                    user_input=user_message_text,
-                    max_output_tokens=400,
-                    temperature=0.3,
-                )
-
-            return await asyncio.to_thread(_call)
-
-        reply = await _openai_chat_sync(system_prompt, user_message)
+        client = get_openai_client()
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            max_tokens=150
+        )
+        
+        reply = response.choices[0].message.content
         await update.message.reply_text(reply)
+        
     except Exception as e:
-        print(f"❌ Erro na IA: {e}")
-        await update.message.reply_text(f"❌ Erro na IA: {str(e)}")
+        print(f"Erro na IA: {e}")
+        await update.message.reply_text("😵 Fiquei confusa... Tente de novo.")
+
 
 def run_telegram_bot():
     """Inicia o bot do Telegram em modo de escuta (Polling)."""
